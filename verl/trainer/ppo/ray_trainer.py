@@ -38,6 +38,7 @@ from verl.utils.seqlen_balancing import get_seqlen_balanced_partitions, log_seql
 from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path
 from verl.utils.dataset.rl_dataset import RLHFDataset, collate_fn
 from verl.utils.timer import TimeoutChecker
+from tensordict import TensorDict
 from torch.utils.data import RandomSampler, SequentialSampler
 from torchdata.stateful_dataloader import StatefulDataLoader
 
@@ -233,6 +234,7 @@ def compute_data_metrics(batch, use_critic=True):
 
     advantages = batch.batch['advantages']
     returns = batch.batch['returns']
+    correct_returns = (sequence_reward > 0) # Note: this could be different if reward is not binary
 
     max_response_length = batch.batch['responses'].shape[-1]
 
@@ -244,6 +246,8 @@ def compute_data_metrics(batch, use_critic=True):
     response_info = _compute_response_info(batch)
     prompt_length = response_info['prompt_length']
     response_length = response_info['response_length']
+    correct_response_lengths = torch.masked_select(response_length, correct_returns)
+    incorrect_response_lengths = torch.masked_select(response_length, ~correct_returns)
 
     valid_adv = torch.masked_select(advantages, response_mask)
     valid_returns = torch.masked_select(returns, response_mask)
@@ -293,12 +297,24 @@ def compute_data_metrics(batch, use_critic=True):
         } if use_critic else {}),
 
         # response length
-        'response_length/mean':
+        'response_length/all/mean':
             torch.mean(response_length).detach().item(),
-        'response_length/max':
+        'response_length/all/max':
             torch.max(response_length).detach().item(),
-        'response_length/min':
+        'response_length/all/min':
             torch.min(response_length).detach().item(),
+        'response_length/correct/mean':
+            torch.mean(correct_response_lengths).detach().item(),
+        'response_length/correct/max':
+            torch.max(correct_response_lengths).detach().item(),
+        'response_length/correct/min':
+            torch.min(correct_response_lengths).detach().item(),
+        'response_length/incorrect/mean':
+            torch.mean(incorrect_response_lengths).detach().item(),
+        'response_length/incorrect/max':
+            torch.max(incorrect_response_lengths).detach().item(),
+        'response_length/incorrect/min':
+            torch.min(incorrect_response_lengths).detach().item(),
         'response_length/clip_ratio':
             torch.mean(torch.eq(response_length, max_response_length).float()).detach().item(),
         # prompt length
@@ -363,7 +379,8 @@ class RayPPOTrainer(object):
 
         # assert torch.cuda.is_available(), 'cuda must be available on driver'
         self.timeout = TimeoutChecker(
-            timeout=config.trainer.get('timeout', '00:03:45:00') # three hours and 45 minutes
+            timeout=config.trainer.get('timeout', '00:03:45:00'), # three hours and 45 minutes
+            fit_last_save_time=True,
         )
         self.tokenizer = tokenizer
         self.config = config
@@ -564,8 +581,18 @@ class RayPPOTrainer(object):
 
     def _maybe_log_train_generations_to_wandb(self, inputs, outputs, rewards):
         """Log a table of training samples to wandb."""
-        # Only log if wandb is used
-        if 'wandb' not in self.config.trainer.logger:
+
+        # If train_generations_to_log_to_wandb is > 0, log a table of training samples to wandb
+        # If it's 0, don't log anything
+        # If it's -1, log all samples
+        # If it's a positive number, log that many samples
+        if hasattr(self.config.trainer, 'train_generations_to_log_to_wandb'):
+            generations_to_log = self.config.trainer.train_generations_to_log_to_wandb
+        else:
+            generations_to_log = -1
+
+        if generations_to_log == 0:
+
             return
 
         import wandb
@@ -574,6 +601,10 @@ class RayPPOTrainer(object):
             self.training_table = wandb.Table(columns=columns)
 
         new_table = wandb.Table(columns=columns, data=self.training_table.data)
+
+        inputs = inputs[:generations_to_log]
+        outputs = outputs[:generations_to_log]
+        rewards = rewards[:generations_to_log]
 
         for inp, outp, rew in zip(inputs, outputs, rewards):
             new_table.add_data(self.global_steps, inp, outp, rew)
@@ -938,6 +969,7 @@ class RayPPOTrainer(object):
         # we start from step 1
         self.global_steps += 1
 
+        self.timeout.start_iterations()
         for epoch in range(self.config.trainer.total_epochs):
             for batch_dict in self.train_dataloader:
                 metrics = {}
@@ -951,7 +983,50 @@ class RayPPOTrainer(object):
                 with _timer('step', timing_raw):
                     # generate a batch
                     with _timer('gen', timing_raw):
-                        gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch)
+                        # NOTE: this is very hacky, but doing this to work around the prompts >= num gpus restriction
+                        #       this is supposed to just duplicate all prompts TP times since that's what
+                        #       is done anyway in fsdp_workers.generate_sequences.
+                        #       Just doing it here since it will be chunked by dp size * tp size when generate_sequences
+                        #       is called below.
+                        orig_gen_batch = gen_batch
+                        tp_size = self.config.actor_rollout_ref.rollout.tensor_model_parallel_size
+                        extended_gen_batch = DataProto()
+
+                        batch_as_dict = gen_batch.batch.to_dict()
+                        original_batch_size = gen_batch.batch.batch_size[0]
+
+                        num_gpus = self.actor_rollout_wg.world_size
+                        real_dp = num_gpus // tp_size
+                        prompts_per_tp_group = original_batch_size // real_dp
+                        assert prompts_per_tp_group > 0
+
+                        output_dict = {}
+                        for key, tensor in batch_as_dict.items():
+                            duplicated_chunks = []
+
+                            for i in range(real_dp):
+                                start_idx = i * prompts_per_tp_group
+                                end_idx = start_idx + prompts_per_tp_group
+                                chunk = tensor[start_idx:end_idx]
+
+                                duplicated_chunks.extend([chunk] * tp_size)
+
+                            output_dict[key] = torch.cat(duplicated_chunks, dim=0)
+
+                        extended_gen_batch.batch = TensorDict(
+                            source=output_dict, batch_size=original_batch_size * tp_size
+                        )
+                        gen_batch_output = self.actor_rollout_wg.generate_sequences(extended_gen_batch)
+                        # double checking that there is no corruption
+                        # TODO: remove after we are confident everything works in all settings
+                        for idx in range(orig_gen_batch.batch.batch_size[0]):
+                            assert torch.allclose(
+                                orig_gen_batch.batch['input_ids'][idx],
+                                # the layout should be prompt1, prompt1, ..., prompt2, prompt2, ...
+                                gen_batch_output.batch['prompts'][idx * self.config.actor_rollout_ref.rollout.n],
+                            )
+
+
                     input_texts = [
                         self.tokenizer.decode(ids, skip_special_tokens=True)
                         for ids in gen_batch.batch['input_ids']
@@ -1075,6 +1150,7 @@ class RayPPOTrainer(object):
                         pprint(f'Step {self.global_steps} validation metrics: {val_metrics}')
                         metrics.update(val_metrics)
 
+                    self.timeout.mark_iteration()
                     if self.config.trainer.save_freq > 0 and \
                             self.global_steps % self.config.trainer.save_freq == 0:
                         with _timer('save_checkpoint', timing_raw):
