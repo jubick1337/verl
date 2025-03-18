@@ -592,6 +592,7 @@ class RayPPOTrainer(object):
             generations_to_log = -1
 
         if generations_to_log == 0:
+
             return
 
         import wandb
@@ -600,9 +601,11 @@ class RayPPOTrainer(object):
             self.training_table = wandb.Table(columns=columns)
 
         new_table = wandb.Table(columns=columns, data=self.training_table.data)
+
         inputs = inputs[:generations_to_log]
         outputs = outputs[:generations_to_log]
         rewards = rewards[:generations_to_log]
+
         for inp, outp, rew in zip(inputs, outputs, rewards):
             new_table.add_data(self.global_steps, inp, outp, rew)
 
@@ -1022,6 +1025,7 @@ class RayPPOTrainer(object):
                                 # the layout should be prompt1, prompt1, ..., prompt2, prompt2, ...
                                 gen_batch_output.batch['prompts'][idx * self.config.actor_rollout_ref.rollout.n],
                             )
+
 
                     input_texts = [
                         self.tokenizer.decode(ids, skip_special_tokens=True)
