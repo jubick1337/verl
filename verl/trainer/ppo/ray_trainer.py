@@ -606,6 +606,8 @@ class RayPPOTrainer(object):
         outputs = outputs[:generations_to_log]
         rewards = rewards[:generations_to_log]
 
+        assert len(inputs) == len(outputs) == len(rewards), f'{len(inputs)=}, {len(outputs)=}, {len(rewards)=} must be equal.\nFirst 5 inputs: {inputs[:5]}\nFirst 5 outputs: {outputs[:5]}\nFirst 5 rewards: {rewards[:5]}'
+
         for inp, outp, rew in zip(inputs, outputs, rewards):
             new_table.add_data(self.global_steps, inp, outp, rew)
 
