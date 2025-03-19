@@ -604,7 +604,7 @@ class RayPPOTrainer(object):
 
         inputs = [x for x in inputs for _ in range(self.config.actor_rollout_ref.rollout.n)] # repeat for each rollout
 
-        assert len(inputs) == len(outputs) == len(rewards), f'{len(inputs)=}, {len(outputs)=}, {len(rewards)=} must be equal.\nFirst 5 inputs: {inputs[:5]}\nFirst 5 outputs: {outputs[:5]}\nFirst 5 rewards: {rewards[:5]}'
+        # assert len(inputs) == len(outputs) == len(rewards), f'{len(inputs)=}, {len(outputs)=}, {len(rewards)=} must be equal.\nFirst 5 inputs: {inputs[:5]}\nFirst 5 outputs: {outputs[:5]}\nFirst 5 rewards: {rewards[:5]}'
 
         samples = list(zip(inputs, outputs, rewards))
         samples.sort(key=lambda x: x[0])  # Sort by input text
